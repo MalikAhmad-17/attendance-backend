@@ -1,210 +1,172 @@
-const User = require('../models/User');
+// backend/controllers/authController.js
+const express = require('express');
+const router = express.Router();
+const { User } = require('../models');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const validator = require('validator');
 
-
-// Create JWT and set httpOnly cookie
+// Helper: set HTTP-only cookie
 const setTokenCookie = (res, payload) => {
-  const token = jwt.sign(payload, process.env.JWT_SECRET, { 
-    expiresIn: process.env.JWT_EXPIRES_IN || '7d' 
+  const token = jwt.sign(payload, process.env.JWT_SECRET, {
+    expiresIn: process.env.JWT_EXPIRES_IN || '7d'
   });
-  
+
+  const cookieName = process.env.COOKIE_NAME || 'att_token';
   const cookieOptions = {
     httpOnly: true,
     secure: process.env.NODE_ENV === 'production',
-    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
-    maxAge: 1000 * 60 * 60 * 24 * 7 // 7 days
+    sameSite: 'lax',
+    maxAge: (parseInt(process.env.JWT_EXPIRES_MS, 10) || 7 * 24 * 3600 * 1000)
   };
-  
-  res.cookie(process.env.COOKIE_NAME || 'att_token', token, cookieOptions);
-};
 
+  res.cookie(cookieName, token, cookieOptions);
+  return token;
+};
 
 // REGISTER
-exports.register = async (req, res) => {
-  const { email, password, role } = req.body;
-  
+router.post('/register', async (req, res) => {
   try {
-    // Validation
-    if (!email || !password) {
-      return res.status(400).json({ message: 'Email and password required.' });
+    const { fullName, email, password, role, uid, dept } = req.body;
+
+    if (!email || !password || !role) {
+      return res.status(400).json({ success: false, message: 'Email, password and role required' });
     }
-    
     if (!validator.isEmail(email)) {
-      return res.status(400).json({ message: 'Invalid email format.' });
+      return res.status(400).json({ success: false, message: 'Invalid email' });
     }
-    
-    if (password.length < 6) {
-      return res.status(400).json({ message: 'Password must be at least 6 characters.' });
+    if (!['admin', 'teacher', 'student'].includes(role)) {
+      return res.status(400).json({ success: false, message: 'Invalid role' });
     }
-    
-    // Check if user already exists
-    const exists = await User.findOne({ email: email.toLowerCase().trim() });
-    if (exists) {
-      return res.status(400).json({ message: 'Email already registered.' });
+
+    // Check existing
+    const existing = await User.findOne({ where: { email: email.toLowerCase().trim() } });
+    if (existing) {
+      return res.status(409).json({ success: false, message: 'Email already in use' });
     }
-    
-    // Hash password
-    const salt = await bcrypt.genSalt(12);
-    const hash = await bcrypt.hash(password, salt);
-    
-    // Create user - default role is 'student' for new registrations
-    const user = await User.create({ 
-      email: email.toLowerCase().trim(), 
-      password: hash, 
-      role: role && ['admin', 'teacher', 'student'].includes(role) ? role : 'student'
+
+    // Create user (password hook will hash)
+    const created = await User.create({
+      fullName, email: email.toLowerCase().trim(), password, role, uid, dept
     });
-    
-    // Create JWT payload with user data from database
-    const payload = { 
-      id: user._id, 
-      email: user.email, 
-      role: user.role // Role from database, not request
-    };
-    
-    setTokenCookie(res, payload);
-    
-    res.status(201).json({ 
-      success: true,
-      user: payload 
-    });
-    
+
+    setTokenCookie(res, { id: created.id, email: created.email, role: created.role });
+    const userObj = created.toJSON();
+    delete userObj.password;
+
+    res.status(201).json({ success: true, user: userObj });
   } catch (err) {
-    console.error('Register error:', err);
-    res.status(500).json({ message: 'Server error during registration.' });
+    console.error('Register error', err);
+    res.status(500).json({ success: false, message: 'Server error' });
   }
-};
+});
 
-
-// LOGIN - ✅ WITH ROLE VALIDATION
-exports.login = async (req, res) => {
-  const { email, password, selectedRole } = req.body;
-  
+// LOGIN
+router.post('/login', async (req, res) => {
   try {
-    // ✅ Validate all three fields
-    if (!email || !password) {
-      return res.status(400).json({ message: 'Email and password required.' });
-    }
+    const { email, password } = req.body;
+    const user = await User.findOne({
+      where: { email: email.toLowerCase().trim() },
+      attributes: { include: ['password', 'failedLoginAttempts', 'accountLockedUntil'] }
+    });
 
-    if (!selectedRole) {
-      return res.status(400).json({ message: 'Please select a role.' });
-    }
-
-    // ✅ Validate selectedRole is valid
-    const validRoles = ['admin', 'teacher', 'student'];
-    if (!validRoles.includes(selectedRole)) {
-      return res.status(400).json({ message: 'Invalid role selected.' });
-    }
-    
-    // Find user by email
-    const user = await User.findOne({ email: email.toLowerCase().trim() });
     if (!user) {
-      return res.status(401).json({ message: 'Invalid credentials.' });
+      return res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
-    
-    // Verify password
+
+    // Check account lock
+    if (user.accountLockedUntil && new Date() < new Date(user.accountLockedUntil)) {
+      return res.status(403).json({ success: false, message: 'Account temporarily locked. Try again later.' });
+    }
+
     const match = await bcrypt.compare(password, user.password);
     if (!match) {
-      return res.status(401).json({ message: 'Invalid credentials.' });
+      // increment failed attempts
+      user.failedLoginAttempts = (user.failedLoginAttempts || 0) + 1;
+      // lock account if too many attempts (example: 5)
+      if (user.failedLoginAttempts >= 5) {
+        user.accountLockedUntil = new Date(Date.now() + 30 * 60 * 1000); // lock 30 minutes
+      }
+      await user.save();
+      return res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
 
-    // ✅ CRITICAL VALIDATION: Check if selected role matches database role
-    if (user.role !== selectedRole) {
-      // ❌ Role mismatch - Security violation!
-      console.log(`⚠️ SECURITY: Role mismatch attempt`);
-      console.log(`   Email: ${email}`);
-      console.log(`   Expected role (from DB): ${user.role}`);
-      console.log(`   Selected role (from form): ${selectedRole}`);
-      console.log(`   Timestamp: ${new Date().toISOString()}`);
-      
-      return res.status(403).json({ 
-        success: false,
-        message: `❌ Role Mismatch! Your account role is "${user.role}", but you selected "${selectedRole}". Please select the correct role.`,
-        actualRole: user.role,
-        selectedRole: selectedRole
-      });
-    }
+    // success: reset failed attempts and set lastLogin
+    user.failedLoginAttempts = 0;
+    user.accountLockedUntil = null;
+    user.lastLogin = new Date();
+    await user.save();
 
-    // ✅ All validations passed - Create JWT with database role
-    const payload = { 
-      id: user._id, 
-      email: user.email, 
-      role: user.role  // Use database role, never use frontend role
-    };
-    
-    setTokenCookie(res, payload);
+    setTokenCookie(res, { id: user.id, email: user.email, role: user.role });
+    const u = user.toJSON();
+    delete u.password;
 
-    console.log(`✅ SUCCESS: User logged in`);
-    console.log(`   Email: ${email}`);
-    console.log(`   Role: ${user.role}`);
-    console.log(`   Timestamp: ${new Date().toISOString()}`);
-
-    res.json({ 
-      success: true,
-      user: payload 
-    });
-    
+    res.json({ success: true, user: u });
   } catch (err) {
-    console.error('❌ LOGIN ERROR:', err.message);
-    res.status(500).json({ 
-      success: false,
-      message: 'Server error during login.' 
-    });
+    console.error('Login error', err);
+    res.status(500).json({ success: false, message: 'Server error' });
   }
-};
-
+});
 
 // LOGOUT
-exports.logout = async (req, res) => {
-  try {
-    res.clearCookie(process.env.COOKIE_NAME || 'att_token', { 
-      httpOnly: true, 
-      sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
-      secure: process.env.NODE_ENV === 'production'
-    });
-    
-    console.log(`✅ User logged out at ${new Date().toISOString()}`);
-    
-    res.json({ 
-      success: true,
-      message: 'Logged out successfully' 
-    });
-  } catch (err) {
-    console.error('Logout error:', err);
-    res.status(500).json({ 
-      success: false,
-      message: 'Server error during logout.' 
-    });
-  }
-};
+router.post('/logout', (req, res) => {
+  const cookieName = process.env.COOKIE_NAME || 'att_token';
+  res.clearCookie(cookieName, { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production' });
+  res.json({ success: true });
+});
 
-
-// GET CURRENT USER
-exports.getCurrentUser = async (req, res) => {
+// Forgot password
+router.post('/forgot-password', async (req, res) => {
   try {
-    const user = await User.findById(req.user.id).select('-password');
-    
-    if (!user) {
-      return res.status(404).json({ 
-        success: false,
-        message: 'User not found' 
-      });
+    const { email } = req.body;
+    if (!email || !validator.isEmail(email)) {
+      return res.status(400).json({ success: false, message: 'Valid email required' });
     }
-    
-    res.json({ 
-      success: true,
-      user: {
-        id: user._id,
-        email: user.email,
-        role: user.role
-      }
-    });
+    const user = await User.findOne({ where: { email: email.toLowerCase().trim() } });
+    if (!user) {
+      return res.status(200).json({ success: true, message: 'If email exists, reset link will be sent' });
+    }
+
+    const resetToken = await user.generatePasswordResetToken();
+    // TODO: send resetToken to user via email using your email provider
+    // Save was done inside method
+    res.json({ success: true, message: 'Password reset token generated', resetToken }); // in prod don't return token
   } catch (err) {
-    console.error('Get user error:', err);
-    res.status(500).json({ 
-      success: false,
-      message: 'Server error' 
-    });
+    console.error('forgot-password', err);
+    res.status(500).json({ success: false, message: 'Server error' });
   }
-};
+});
+
+// Reset password endpoint
+router.post('/reset-password', async (req, res) => {
+  try {
+    const { token, newPassword } = req.body;
+    if (!token || !newPassword) return res.status(400).json({ success: false, message: 'Token and newPassword required' });
+
+    // hash received token to compare with stored hash
+    const crypto = require('crypto');
+    const hashed = crypto.createHash('sha256').update(token).digest('hex');
+
+    const user = await User.findOne({
+      where: {
+        resetPasswordToken: hashed,
+        resetPasswordExpires: { [require('sequelize').Op.gt]: new Date() }
+      },
+      attributes: { include: ['password', 'resetPasswordToken', 'resetPasswordExpires'] }
+    });
+
+    if (!user) return res.status(400).json({ success: false, message: 'Invalid or expired token' });
+
+    user.password = newPassword; // hook will hash on save
+    user.resetPasswordToken = null;
+    user.resetPasswordExpires = null;
+    await user.save();
+
+    res.json({ success: true, message: 'Password reset successful' });
+  } catch (err) {
+    console.error('reset-password', err);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+module.exports = router;
