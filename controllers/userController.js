@@ -1,14 +1,24 @@
+
 // backend/controllers/userController.js
+
 const express = require('express');
 const router = express.Router();
-const { User } = require('../models');
 const { Op } = require('sequelize');
 
-// Helper: append _id alias for Mongo-compatibility (so frontend code that uses _id keeps working)
+// Import models (ensure models/index.js exports these)
+const {
+  sequelize,
+  User,
+  Settings,
+  TwoFactorAuth,
+  CloudBackup,
+  Attendance
+} = require('../models');
+
+// Helper: append _id alias for Mongo-compatibility
 function withIdAlias(userInstance) {
   if (!userInstance) return null;
   const obj = userInstance.toJSON ? userInstance.toJSON() : { ...userInstance };
-  // alias id -> _id for older frontend code
   obj._id = obj.id;
   return obj;
 }
@@ -30,14 +40,14 @@ router.post('/', async (req, res) => {
     }
 
     const created = await User.create({
-      fullName,
+      fullName: fullName || '',
       email: normalizedEmail,
       password,
       role,
-      uid,
-      dept,
-      phone,
-      address
+      uid: uid || '',
+      dept: dept || '',
+      phone: phone || '',
+      address: address || ''
     });
 
     const result = withIdAlias(created);
@@ -50,7 +60,7 @@ router.post('/', async (req, res) => {
 });
 
 // ---------------------------
-// ADMIN RESET PASSWORD (NEW)
+// ADMIN RESET PASSWORD
 // POST /api/users/reset-password
 // body: { userId: "<id or email>", newPassword: "<newpass>" }
 // ---------------------------
@@ -105,6 +115,7 @@ router.get('/me', async (req, res) => {
 
     const user = await User.findByPk(id);
     if (!user) return res.status(404).json({ message: 'User not found' });
+
     const u = withIdAlias(user);
     delete u.password;
     res.json({ success: true, user: u });
@@ -115,21 +126,37 @@ router.get('/me', async (req, res) => {
 });
 
 // ---------------------------
-// LIST users
+// LIST users (MUST BE BEFORE /:id routes)
 // ---------------------------
 router.get('/', async (req, res) => {
   try {
-    const q = {};
-    if (req.query.role) q.role = req.query.role;
-    if (req.query.email) q.email = { [Op.like]: `%${req.query.email}%` };
+    console.log('📝 GET /api/users called');
 
+    const q = {};
+
+    // Filter by role if provided
+    if (req.query.role) {
+      q.role = req.query.role;
+      console.log('  Filtering by role:', req.query.role);
+    }
+
+    // Filter by email if provided
+    if (req.query.email) {
+      q.email = { [Op.like]: `%${req.query.email}%` };
+      console.log('  Filtering by email:', req.query.email);
+    }
+
+    // Fetch all users
     const users = await User.findAll({
       where: q,
       attributes: { exclude: ['password', 'resetPasswordToken'] },
-      limit: parseInt(req.query.limit, 10) || 100,
+      limit: parseInt(req.query.limit, 10) || 1000,
       order: [['createdAt', 'DESC']]
     });
 
+    console.log(`✅ Found ${users.length} users`);
+
+    // Map and remove passwords
     const mapped = users.map(withIdAlias).map(u => {
       delete u.password;
       return u;
@@ -137,8 +164,29 @@ router.get('/', async (req, res) => {
 
     res.json({ success: true, users: mapped });
   } catch (err) {
-    console.error('GET /users', err);
-    res.status(500).json({ message: 'Server error' });
+    console.error('❌ GET /users error:', err);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// ---------------------------
+// GET user by id
+// ---------------------------
+router.get('/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const user = await User.findByPk(id);
+
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    const u = withIdAlias(user);
+    delete u.password;
+    res.json({ success: true, user: u });
+  } catch (err) {
+    console.error('GET /users/:id error:', err);
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -149,38 +197,102 @@ router.put('/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const updates = req.body;
+
     if (updates.email) {
-      const existing = await User.findOne({ where: { email: updates.email, id: { [Op.ne]: id } } });
-      if (existing) return res.status(409).json({ message: 'Email already used' });
+      const existing = await User.findOne({
+        where: {
+          email: updates.email,
+          id: { [Op.ne]: id }
+        }
+      });
+      if (existing) {
+        return res.status(409).json({ success: false, message: 'Email already used' });
+      }
     }
 
     const user = await User.findByPk(id);
-    if (!user) return res.status(404).json({ message: 'User not found' });
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
 
     Object.assign(user, updates);
     await user.save();
+
     const u = withIdAlias(user);
     delete u.password;
     res.json({ success: true, user: u });
   } catch (err) {
-    console.error('PUT /users/:id', err);
-    res.status(500).json({ message: 'Server error' });
+    console.error('PUT /users/:id error:', err);
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
 // ---------------------------
-// DELETE user
+// DELETE user (SAFE) - nullify settings.updatedBy, remove 2FA/backups, commit in transaction
 // ---------------------------
 router.delete('/:id', async (req, res) => {
+  const t = await sequelize.transaction();
   try {
     const { id } = req.params;
-    const user = await User.findByPk(id);
-    if (!user) return res.status(404).json({ message: 'User not found' });
-    await user.destroy();
-    res.json({ success: true, message: 'User deleted' });
+    console.log('🗑 Attempting delete user id:', id);
+
+    const user = await User.findByPk(id, { transaction: t });
+    if (!user) {
+      await t.rollback();
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    // 1) Nullify Settings.updatedBy that reference this user
+    if (Settings) {
+      const [affectedCount] = await Settings.update(
+        { updatedBy: null },
+        { where: { updatedBy: id }, transaction: t }
+      );
+      if (affectedCount > 0) {
+        console.log(`🔁 Nullified updatedBy in ${affectedCount} settings row(s) for user ${id}`);
+      }
+    }
+
+    // 2) Delete TwoFactorAuth entries for this user (if model present)
+    if (TwoFactorAuth && TwoFactorAuth.destroy) {
+      await TwoFactorAuth.destroy({ where: { userId: id }, transaction: t });
+    }
+
+    // 3) Delete CloudBackup entries owned by user (if model present)
+    if (CloudBackup && CloudBackup.destroy) {
+      await CloudBackup.destroy({ where: { userId: id }, transaction: t });
+    }
+
+    // 4) Optionally nullify attendance.userId to preserve attendance history
+    if (Attendance && Attendance.update) {
+      try {
+        await Attendance.update({ userId: null }, { where: { userId: id }, transaction: t });
+      } catch (e) {
+        // If attendance update fails, continue — it's non-critical for deletion
+        console.warn('Could not nullify attendance.userId for user:', id, e.message || e);
+      }
+    }
+
+    // 5) Delete the user
+    await user.destroy({ transaction: t });
+
+    await t.commit();
+    console.log('✅ User deleted:', id);
+    return res.json({ success: true, message: 'User deleted successfully' });
   } catch (err) {
-    console.error('DELETE /users/:id', err);
-    res.status(500).json({ message: 'Server error' });
+    await t.rollback();
+    console.error('DELETE /users/:id error:', err);
+
+    // If FK constraint error, return human-friendly message
+    if (err && err.name === 'SequelizeForeignKeyConstraintError') {
+      return res.status(400).json({
+        success: false,
+        message: 'Cannot delete user: referenced by other records. References have not been removed automatically.',
+        detail: err.parent?.sqlMessage || err.message
+      });
+    }
+
+    return res.status(500).json({ success: false, message: 'Server error', error: err.message });
   }
 });
 
